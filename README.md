@@ -511,5 +511,379 @@ void loop() {
   if (now - teleTimer >= TELE_PERIOD_MS) {
     teleTimer = now;
     sendTelemetryLine();
+    #include <Arduino.h>
+#include <Wire.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
+
+// ================= PINS =================
+
+// MPU6050
+#define MPU_ADDR 0x68
+#define MPU_SDA 21
+#define MPU_SCL 22
+
+// L298N
+#define ENA 13
+#define IN1 12
+#define IN2 14
+#define IN3 27
+#define IN4 26
+#define ENB 25
+
+// SIM808 GPS UART2
+#define SIM808_RX 16   // ESP32 RX <- SIM808 TX
+#define SIM808_TX 17   // ESP32 TX -> SIM808 RX
+
+// RTC DS1302
+#define RTC_RST 19
+#define RTC_DAT 18
+#define RTC_CLK 5
+
+// Sensors
+#define VIB_PIN 23
+#define MQ3_PIN 32
+#define LM35_1 33
+#define LM35_2 34
+#define LM35_3 35
+#define LM35_4 4
+
+// ESP32-CAM uses Serial0
+// GPIO1 TX -> ESP32-CAM RX
+// GPIO3 RX <- ESP32-CAM TX
+
+// ================= RTC =================
+ThreeWire myWire(RTC_DAT, RTC_CLK, RTC_RST);
+RtcDS1302<ThreeWire> Rtc(myWire);
+
+// ================= GPS =================
+HardwareSerial sim808(2);
+
+String gpsRaw = "";
+String gpsFix = "0";
+String gpsLat = "";
+String gpsLon = "";
+String gpsAlt = "";
+String gpsSpeed = "";
+
+// ================= MPU =================
+float ax_g = 0, ay_g = 0, az_g = 0;
+float baseAx = 0;
+String mpuMove = "STILL";
+
+// ================= TIMERS =================
+unsigned long moveTimer = 0;
+unsigned long teleTimer = 0;
+unsigned long gpsTimer = 0;
+
+const unsigned long MOVE_PERIOD = 5000;
+const unsigned long TELE_PERIOD = 500;
+const unsigned long GPS_PERIOD  = 10000;
+
+// ================= STATE =================
+bool forwardState = true;
+int motorSpeed = 180;
+
+volatile bool vibrationDetected = false;
+
+// ================= INTERRUPT =================
+void IRAM_ATTR vibrationISR() {
+  vibrationDetected = true;
+}
+
+// ================= MOTOR =================
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void moveForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+}
+
+void moveBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+}
+
+// ================= RTC =================
+String getRtcTime() {
+  RtcDateTime now = Rtc.GetDateTime();
+
+  char buf[32];
+  snprintf(buf, sizeof(buf),
+           "%04u-%02u-%02u %02u:%02u:%02u",
+           now.Year(), now.Month(), now.Day(),
+           now.Hour(), now.Minute(), now.Second());
+
+  return String(buf);
+}
+
+// ================= MPU =================
+bool mpuWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+bool mpuRead(uint8_t reg, uint8_t *data, uint8_t len) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0) return false;
+
+  uint8_t got = Wire.requestFrom(MPU_ADDR, len, true);
+  if (got != len) return false;
+
+  for (int i = 0; i < len; i++) {
+    data[i] = Wire.read();
+  }
+
+  return true;
+}
+
+int16_t be16(uint8_t hi, uint8_t lo) {
+  return (int16_t)((hi << 8) | lo);
+}
+
+void initMPU() {
+  mpuWrite(0x6B, 0x00);
+  mpuWrite(0x1C, 0x00);
+}
+
+void readMPU() {
+  uint8_t b[6];
+
+  if (!mpuRead(0x3B, b, 6)) {
+    ax_g = ay_g = az_g = 0;
+    return;
+  }
+
+  int16_t axRaw = be16(b[0], b[1]);
+  int16_t ayRaw = be16(b[2], b[3]);
+  int16_t azRaw = be16(b[4], b[5]);
+
+  ax_g = axRaw / 16384.0;
+  ay_g = ayRaw / 16384.0;
+  az_g = azRaw / 16384.0;
+
+  float diff = ax_g - baseAx;
+
+  if (diff > 0.08) {
+    mpuMove = "FORWARD_ACCEL";
+  } else if (diff < -0.08) {
+    mpuMove = "BACKWARD_ACCEL";
+  } else {
+    mpuMove = "STABLE";
+  }
+}
+
+void calibrateMPU() {
+  float sum = 0;
+
+  for (int i = 0; i < 50; i++) {
+    readMPU();
+    sum += ax_g;
+    delay(20);
+  }
+
+  baseAx = sum / 50.0;
+}
+
+// ================= SENSORS =================
+float readLM35(int pin) {
+  int adc = analogRead(pin);
+  float voltage = adc * (3.3 / 4095.0);
+  return voltage * 100.0;
+}
+float readMQ3Voltage() {
+  int adc = analogRead(MQ3_PIN);
+  return adc * (3.3 / 4095.0);
+}
+
+// ================= GPS =================
+void sendGPSCommand(String cmd) {
+  sim808.println(cmd);
+}
+
+void parseCGNSINF(String line) {
+  gpsRaw = line;
+
+  int field = 0;
+  String value = "";
+
+  String parts[20];
+  int idx = 0;
+
+  for (int i = 0; i < line.length(); i++) {
+    char c = line[i];
+
+    if (c == ',' || c == ':') {
+      parts[idx++] = value;
+      value = "";
+      if (idx >= 20) break;
+    } else {
+      value += c;
+    }
+  }
+
+  if (idx < 6) return;
+
+  gpsFix   = parts[2];
+  gpsLat   = parts[4];
+  gpsLon   = parts[5];
+  gpsAlt   = parts[6];
+  gpsSpeed = parts[7];
+}
+
+void updateGPS() {
+  while (sim808.available()) {
+    String line = sim808.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("+CGNSINF:")) {
+      parseCGNSINF(line);
+    }
+  }
+
+  if (millis() - gpsTimer >= GPS_PERIOD) {
+    gpsTimer = millis();
+    sendGPSCommand("AT+CGNSINF");
+  }
+}
+
+// ================= TELEMETRY =================
+void sendTelemetry() {
+  int mq3Raw = analogRead(MQ3_PIN);
+  float mq3Voltage = readMQ3Voltage();
+
+  int vib = digitalRead(VIB_PIN);
+
+  float t1 = readLM35(LM35_1);
+  float t2 = readLM35(LM35_2);
+  float t3 = readLM35(LM35_3);
+  float t4 = readLM35(LM35_4);
+
+  String motorStatus = forwardState ? "FORWARD" : "BACKWARD";
+
+  String line = "";
+
+  line += "REC=s";
+  line += ",RTC=" + getRtcTime();
+
+  line += ",MOTOR=" + motorStatus;
+  line += ",PWM=" + String(motorSpeed);
+
+  line += ",MQ3_RAW=" + String(mq3Raw);
+  line += ",MQ3_V=" + String(mq3Voltage, 3);
+
+  line += ",VIB=" + String(vib);
+  line += ",VIB_EVENT=" + String(vibrationDetected ? 1 : 0);
+
+  line += ",LM35_1=" + String(t1, 1);
+  line += ",LM35_2=" + String(t2, 1);
+  line += ",LM35_3=" + String(t3, 1);
+  line += ",LM35_4=" + String(t4, 1);
+
+  line += ",AX=" + String(ax_g, 3);
+  line += ",AY=" + String(ay_g, 3);
+  line += ",AZ=" + String(az_g, 3);
+  line += ",MPU_MOVE=" + mpuMove;
+
+  line += ",GPS_FIX=" + gpsFix;
+  line += ",LAT=" + gpsLat;
+  line += ",LON=" + gpsLon;
+  line += ",ALT=" + gpsAlt;
+  line += ",GPS_SPEED=" + gpsSpeed;
+
+  Serial.println(line);
+
+  vibrationDetected = false;
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  sim808.begin(9600, SERIAL_8N1, SIM808_RX, SIM808_TX);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  pinMode(VIB_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(VIB_PIN), vibrationISR, RISING);
+
+  analogReadResolution(12);
+
+  Wire.begin(MPU_SDA, MPU_SCL);
+  initMPU();
+  delay(500);
+  calibrateMPU();
+
+  Rtc.Begin();
+  if (!Rtc.GetIsRunning()) {
+    Rtc.SetIsRunning(true);
+  }
+
+  delay(2000);
+
+  sim808.println("AT");
+  delay(500);
+  sim808.println("ATE0");
+  delay(500);
+  sim808.println("AT+CGNSPWR=1");
+  delay(1000);
+
+  moveTimer = millis();
+  teleTimer = millis();
+  gpsTimer = millis();
+
+  moveForward();
+}
+
+// ================= LOOP =================
+void loop() {
+  updateGPS();
+  readMPU();
+
+  if (millis() - moveTimer >= MOVE_PERIOD) {
+    moveTimer = millis();
+
+    forwardState = !forwardState;
+
+    if (forwardState) {
+      moveForward();
+    } else {
+      moveBackward();
+    }
+  }
+
+  if (millis() - teleTimer >= TELE_PERIOD) {
+    teleTimer = millis();
+    sendTelemetry();
+  }
+}
   }
 }
